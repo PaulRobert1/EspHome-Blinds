@@ -1,0 +1,223 @@
+esphome:
+  name: blinds
+  friendly_name: blinds
+  on_boot:
+    priority: -100
+    then:
+      # Optional: You can uncomment the following lines to make the blind
+      # "home" itself on every reboot, ensuring it knows its position.
+      # - logger.log: "Device booted. Starting homing sequence to find top limit."
+      # - globals.set: { id: move_direction, value: '-1' }
+      # - servo.write: { id: blind_servo, level: 1.0 } # CHANGED: Was -1.0, now 1.0 for UP
+
+esp8266:
+  board: d1_mini
+
+logger:
+
+api:
+  encryption:
+    key: "KEY"
+
+ota:
+  - platform: esphome
+    password: "PASSWORD"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+globals:
+  - id: max_pos
+    type: int
+    restore_value: yes
+    initial_value: '1000'
+  - id: current_pos
+    type: int
+    restore_value: yes
+    initial_value: '0'
+  - id: move_direction
+    type: int
+    initial_value: '0'
+  - id: auto_move_active
+    type: bool
+    initial_value: 'false'
+
+output:
+  - platform: esp8266_pwm
+    id: servo_pwm_output
+    pin: D1
+    frequency: 50 Hz
+
+servo:
+  - id: blind_servo
+    output: servo_pwm_output
+
+interval:
+  - interval: 100ms
+    then:
+      # DOWN logic (This is correct)
+      - if:
+          condition: { lambda: 'return id(move_direction) == 1;' }
+          then:
+            - if:
+                condition: { lambda: 'return id(current_pos) < id(max_pos);' }
+                then:
+                  - globals.set: { id: current_pos, value: !lambda 'return id(current_pos) + 1;' }
+                else:
+                  - globals.set: { id: move_direction, value: '0' }
+                  - servo.write: { id: blind_servo, level: 0.0 }
+      
+      # UP logic (With corrected, larger safety buffer)
+      - if:
+          condition: { lambda: 'return id(move_direction) == -1;' }
+          then:
+            # CHANGED: The safety buffer is now much larger.
+            - if:
+                condition: { lambda: 'return id(current_pos) > -1000;' } 
+                then:
+                  # Keep decrementing until the physical limit switch is hit.
+                  - globals.set: { id: current_pos, value: !lambda 'return id(current_pos) - 1;' }
+                else:
+                  # EMERGENCY stop if the physical limit switch fails.
+                  - logger.log: "EMERGENCY STOP: Moving up but limit switch was not found. Check wiring!"
+                  - globals.set: { id: move_direction, value: '0' }
+                  - servo.write: { id: blind_servo, level: 0.0 }
+script:
+  - id: long_press_down_timer
+    mode: restart
+    then:
+      - delay: 5s
+      - if:
+          condition:
+            binary_sensor.is_on: button_down
+          then:
+            - globals.set: { id: auto_move_active, value: 'true' }
+            - logger.log: "Long press down detected, moving to max limit."
+
+  - id: long_press_up_timer
+    mode: restart
+    then:
+      - delay: 5s
+      - if:
+          condition:
+            binary_sensor.is_on: button_up
+          then:
+            - globals.set: { id: auto_move_active, value: 'true' }
+            - logger.log: "Long press up detected, moving to min limit."
+
+# ===================================================================
+# SENSORS (PHYSICAL BUTTONS & LIMIT SWITCH)
+# ===================================================================
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: D5
+      mode: INPUT_PULLUP
+      inverted: true
+    name: "Blinds Top Limit Switch"
+    id: limit_switch_top
+    on_press:
+      - logger.log: "Top limit switch triggered. Resetting position to 0."
+      - globals.set: { id: current_pos, value: '0' }
+      - if:
+          condition:
+            lambda: 'return id(move_direction) == -1;'
+          then:
+            - logger.log: "Stopping upward movement due to limit switch."
+            - globals.set: { id: move_direction, value: '0' }
+            - globals.set: { id: auto_move_active, value: 'false' }
+            - servo.write: { id: blind_servo, level: 0.0 }
+
+  - platform: gpio
+    pin:
+      number: D2
+      mode: INPUT_PULLUP
+    name: "Physical Down Button"
+    id: button_down
+    on_press:
+      - globals.set: { id: auto_move_active, value: 'false' }
+      - globals.set: { id: move_direction, value: '1' }
+      - servo.write: { id: blind_servo, level: -1.0 } # CHANGED: Was 1.0, now -1.0 for DOWN
+      - script.execute: long_press_down_timer
+    on_release:
+      - script.stop: long_press_down_timer
+      - if:
+          condition:
+            lambda: 'return !id(auto_move_active);'
+          then:
+            - globals.set: { id: move_direction, value: '0' }
+            - servo.write: { id: blind_servo, level: 0.0 }
+
+  - platform: gpio
+    pin:
+      number: D3
+      mode: INPUT_PULLUP
+    name: "Physical Up Button"
+    id: button_up
+    on_press:
+      - globals.set: { id: auto_move_active, value: 'false' }
+      - globals.set: { id: move_direction, value: '-1' }
+      - servo.write: { id: blind_servo, level: 1.0 } # CHANGED: Was -1.0, now 1.0 for UP
+      - script.execute: long_press_up_timer
+    on_release:
+      - script.stop: long_press_up_timer
+      - if:
+          condition:
+            lambda: 'return !id(auto_move_active);'
+          then:
+            - globals.set: { id: move_direction, value: '0' }
+            - servo.write: { id: blind_servo, level: 0.0 }
+
+# The switches in Home Assistant
+switch:
+  - platform: template
+    name: "Move Down"
+    id: move_down_switch
+    icon: "mdi:arrow-down-box"
+    lambda: 'return id(move_direction) == 1;'
+    turn_on_action:
+      - globals.set: {id: move_direction, value: '1'}
+      - servo.write: {id: blind_servo, level: -1.0} # CHANGED: Was 1.0, now -1.0 for DOWN
+    turn_off_action:
+      - globals.set: {id: move_direction, value: '0'}
+      - servo.write: {id: blind_servo, level: 0.0}
+
+  - platform: template
+    name: "Move Up"
+    id: move_up_switch
+    icon: "mdi:arrow-up-box"
+    lambda: 'return id(move_direction) == -1;'
+    turn_on_action:
+      - globals.set: {id: move_direction, value: '-1'}
+      - servo.write: {id: blind_servo, level: 1.0} # CHANGED: Was -1.0, now 1.0 for UP
+    turn_off_action:
+      - globals.set: {id: move_direction, value: '0'}
+      - servo.write: {id: blind_servo, level: 0.0}
+
+# The calibration buttons
+button:
+  - platform: template
+    name: "Save This as Max Position"
+    icon: "mdi:content-save-cog"
+    on_press:
+      - globals.set:
+          id: max_pos
+          value: !lambda 'return id(current_pos);'
+      - logger.log:
+          format: "New max position saved: %d"
+          args: [ 'id(max_pos)' ]
+
+  - platform: template
+    name: "Reset Calibration"
+    icon: "mdi:restore"
+    on_press:
+      - globals.set: { id: max_pos, value: '1000' }
+      - logger.log: "Calibration has been reset to default."
+
+# A sensor to see the current position value
+sensor:
+  - platform: template
+    name: "Blinds Position Counter"
+    lambda: 'return id(current_pos);'
+    update_interval: 1s
